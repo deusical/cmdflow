@@ -50,10 +50,16 @@ func Example() {
 		panic(err)
 	}
 
-	// Each event snapshots the recipe; the effect reaches only the host.
+	// Each event snapshots the recipe. Accept works out the greeting but
+	// nothing acts yet: the host stores the accepted run, then Resume hands
+	// the reply's intent to the host.
 	run := cmdflow.Snapshot(recipe, map[string]cmdflow.Value{"name": {Type: "text", Text: "Ada"}})
 	host := &greetHost{}
 	accepted, _ := e.Accept(greetCtx{}, run, host)
-	fmt.Println(accepted == cmdflow.Ready, host.said)
-	// Output: true [Hi, Ada!]
+	fmt.Println(accepted, host.said)
+	stopped, _ := e.Resume(greetCtx{}, run, host)
+	fmt.Println(stopped, host.said)
+	// Output:
+	// ready []
+	// false [Hi, Ada!]
 }

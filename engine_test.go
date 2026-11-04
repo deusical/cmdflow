@@ -223,7 +223,7 @@ func TestRunsAcceptYieldResumeAndGateEffects(t *testing.T) {
 	if got, err := e.Accept(c, run, h); got != Ready || err != nil {
 		t.Fatal(got, err)
 	}
-	if !run.Steps[1].Done || run.Steps[2].Done {
+	if run.Steps[1].Status != StatusDone || run.Steps[2].Status != StatusPending {
 		t.Fatal("immediate step not done at acceptance")
 	}
 	// The run survives a round trip through storage.
@@ -239,7 +239,8 @@ func TestRunsAcceptYieldResumeAndGateEffects(t *testing.T) {
 	if stopped, err := e.Resume(c, &stored, h); stopped || err != nil {
 		t.Fatal(stopped, err)
 	}
-	if len(h.effects) != 1 || h.effects[0] != "HI!?" || h.saves != 2 {
+	// Saves: the yield, the slow step, the sink's intent, its delivery.
+	if len(h.effects) != 1 || h.effects[0] != "HI!?" || h.saves != 4 {
 		t.Fatalf("effects %v saves %d", h.effects, h.saves)
 	}
 	// An edit to the command doesn't touch the run.
@@ -255,8 +256,11 @@ func TestDirectEffectsSkipTheHost(t *testing.T) {
 	_ = e.Validate(&p, nil)
 	h := &toyHost{}
 	run := Snapshot(p, map[string]Value{"word": text("hi")})
-	if got, _ := e.Accept(&toyCtx{}, run, h); got != Ready || len(h.effects) != 0 {
-		t.Fatal("direct effect went through the host")
+	if got, _ := e.Accept(&toyCtx{}, run, h); got != Ready || run.Steps[2].Status != StatusDone {
+		t.Fatal("direct sink not done at acceptance", got)
+	}
+	if stopped, err := e.Resume(&toyCtx{}, run, h); stopped || err != nil || len(h.effects) != 0 {
+		t.Fatal("direct effect went through the host", stopped, err)
 	}
 }
 
@@ -266,7 +270,7 @@ func TestHaltFailAndUnavailable(t *testing.T) {
 	_ = e.Validate(&p, nil)
 	h := &toyHost{}
 	run := Snapshot(p, map[string]Value{"word": text("")})
-	if got, _ := e.Accept(&toyCtx{}, run, h); got != Halted || h.halted != "say something" || !run.Halted || !run.Steps[1].Done {
+	if got, _ := e.Accept(&toyCtx{}, run, h); got != Halted || h.halted != "say something" || !run.Halted() || run.Steps[1].Status != StatusHalted || run.Steps[2].Status != StatusSkipped {
 		t.Fatal("halt at acceptance", got, h.halted)
 	}
 	if stopped, _ := e.Resume(&toyCtx{}, run, h); stopped || len(h.effects) != 0 {
@@ -277,11 +281,17 @@ func TestHaltFailAndUnavailable(t *testing.T) {
 	run = Snapshot(q, map[string]Value{"word": text("x")})
 	h = &toyHost{}
 	e.Accept(&toyCtx{}, run, h)
-	if stopped, _ := e.Resume(&toyCtx{}, run, h); !stopped || h.failed != "count_broken" {
-		t.Fatal("failure not reported", h.failed)
+	if stopped, _ := e.Resume(&toyCtx{}, run, h); !stopped || h.failed != "count_broken" || len(h.effects) != 0 {
+		t.Fatal("failure not reported, or the later effect acted", h.failed, h.effects)
+	}
+	if step, code, failed := run.Failed(); !failed || step != "n" || code != "count_broken" {
+		t.Fatal("failure not recorded in the run", step, code)
+	}
+	if stopped, err := e.Resume(&toyCtx{}, run, h); !stopped || !errors.Is(err, ErrFailed) {
+		t.Fatal("a failed run resumed", stopped, err)
 	}
 	run.Steps[1].Version = 9
-	run.Steps[1].Done = false
+	run.Steps[1].Status, run.Steps[1].Code = StatusPending, ""
 	h = &toyHost{}
 	if stopped, _ := e.Resume(&toyCtx{}, run, h); !stopped || h.failed != CodeUnavailable {
 		t.Fatal("unregistered version ran", h.failed)
@@ -297,11 +307,15 @@ func TestSimulateAndTake(t *testing.T) {
 		t.Fatal(trace, halt, err)
 	}
 	run := &Run{Steps: []StepRun{
-		{ID: "a", Done: true, Outputs: map[string]Value{"v": {Type: "blob", Data: json.RawMessage(`"big"`)}}},
+		{ID: "a", Status: StatusDone, Outputs: map[string]Value{"v": {Type: "blob", Data: json.RawMessage(`"big"`)}}},
 		{ID: "b", Inputs: map[string]string{"in": "a.v"}},
 	}}
 	s := &Step{StepRun: &run.Steps[1], run: run}
-	if v, ok := s.Take("in"); !ok || string(v.Data) != `"big"` || run.Steps[0].Outputs["v"].Data != nil {
+	if v, ok := s.Take("in"); !ok || string(v.Data) != `"big"` || run.Steps[0].Outputs["v"].Data == nil {
+		t.Fatal("take cleared the data before the step finished")
+	}
+	s.finish()
+	if run.Steps[0].Outputs["v"].Data != nil {
 		t.Fatal("take kept the data twice")
 	}
 }
@@ -356,7 +370,7 @@ func TestDispatchHaltSavesOrStops(t *testing.T) {
 	if got, _ := e.Accept(&toyCtx{}, run, h); got != Ready {
 		t.Fatal("not ready")
 	}
-	if stopped, err := e.Resume(&toyCtx{}, run, h); stopped || err != nil || h.halted != "say something" || !run.Halted || len(h.effects) != 0 {
+	if stopped, err := e.Resume(&toyCtx{}, run, h); stopped || err != nil || h.halted != "say something" || !run.Halted() || len(h.effects) != 0 {
 		t.Fatal("dispatch halt", stopped, err, h.halted)
 	}
 	run = Snapshot(p, map[string]Value{"word": text("x")})
@@ -366,13 +380,13 @@ func TestDispatchHaltSavesOrStops(t *testing.T) {
 		t.Fatal("a failed save after a halt let the run go on", stopped, err)
 	}
 	// A failed save after a finished step stops too.
-	run = Snapshot(Pipeline{Steps: []StepConfig{step("w", "slow", map[string]string{"in": "trigger.word"}, ""), step("say", "print", map[string]string{"text": "w.out"}, "")}}, map[string]Value{"word": text("x")})
-	for i := range run.Steps {
-		if run.Steps[i].Module == "slow" {
-			run.Steps[i].Version = 2
-		}
+	q := Pipeline{Steps: []StepConfig{step("w", "slow", map[string]string{"in": "trigger.word"}, ""), step("say", "print", map[string]string{"text": "w.out"}, "")}}
+	if err := e.Validate(&q, nil); err != nil {
+		t.Fatal(err)
 	}
+	run = Snapshot(q, map[string]Value{"word": text("x")})
 	f = &failingHost{}
+	e.Accept(&toyCtx{}, run, f)
 	if stopped, err := e.Resume(&toyCtx{slowReady: true}, run, f); !stopped || err == nil {
 		t.Fatal("a failed save after a step let the run go on", stopped, err)
 	}
@@ -390,6 +404,7 @@ func TestAdmissionDeclinesBeforeAnyAccept(t *testing.T) {
 			}
 			return false, nil
 		},
+		Run: func(*toyCtx, *Step) (Outcome, error) { return Done(), nil },
 	})
 	e.Register(Module[*toyCtx]{
 		Definition: Definition{ID: "mark", Version: 1, Title: "Mark", Effect: Pure, Immediate: true,
@@ -421,7 +436,8 @@ func TestSimulatedHaltAndRegistrationGuards(t *testing.T) {
 			t.Fatal("untyped port registered")
 		}
 	}()
-	e.Register(Module[*toyCtx]{Definition: Definition{ID: "untyped", Version: 1, Outputs: []Port{{Name: "x"}}}})
+	e.Register(Module[*toyCtx]{Definition: Definition{ID: "untyped", Version: 1, Effect: Pure, Outputs: []Port{{Name: "x"}}},
+		Run: func(*toyCtx, *Step) (Outcome, error) { return Done(), nil }})
 }
 
 func TestSnapshotAndCloneShareNothing(t *testing.T) {
