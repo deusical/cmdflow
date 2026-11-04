@@ -308,8 +308,10 @@ type Host interface {
 
 // Snapshot fixes a validated pipeline into a new run, with the trigger's
 // outputs. The run shares nothing with p, so later edits to p never reach it.
+// A pipeline Validate never accepted makes a run Accept and Simulate refuse
+// with ErrNotValidated.
 func Snapshot(p Pipeline, trigger map[string]Value) *Run {
-	run := &Run{Format: FormatVersion, Steps: make([]StepRun, 0, len(p.Steps)+1)}
+	run := &Run{Format: p.Format, Steps: make([]StepRun, 0, len(p.Steps)+1)}
 	run.Steps = append(run.Steps, StepRun{ID: TriggerStep, Module: TriggerStep, Version: 1, Status: StatusDone, Outputs: copyValues(trigger)})
 	if run.Steps[0].Outputs == nil {
 		run.Steps[0].Outputs = map[string]Value{}
@@ -325,9 +327,10 @@ const (
 	// CodeUnavailable: a step names a module or version that is not
 	// registered, or one that cannot run on Resume.
 	CodeUnavailable = "module_unavailable"
-	// CodeIncomplete: a module returned an outcome it may not, set an output
-	// it doesn't declare (or of the wrong type), or a step's required input
-	// has no value.
+	// CodeIncomplete: a module returned an outcome it may not, failed
+	// without a code, set an output it doesn't declare (or of the wrong
+	// type), or a step's required input has no value when it runs or when
+	// its intent is delivered.
 	CodeIncomplete = "step_incomplete"
 )
 
@@ -337,6 +340,12 @@ var (
 	ErrUnavailable = errors.New("cmdflow: module unavailable")
 	// ErrFormat means a run's format is not FormatVersion.
 	ErrFormat = errors.New("cmdflow: unsupported run format")
+	// ErrNotValidated means a run was made from a pipeline Validate never
+	// accepted.
+	ErrNotValidated = errors.New("cmdflow: pipeline not validated")
+	// ErrTriggerValue means a trigger value's type doesn't fit the input it
+	// is connected to.
+	ErrTriggerValue = errors.New("cmdflow: trigger value has the wrong type")
 	// ErrAccepted means Accept was called on a run already accepted.
 	ErrAccepted = errors.New("cmdflow: run already accepted")
 	// ErrNotAccepted means Resume was called on a run Accept never accepted.
@@ -417,20 +426,36 @@ const (
 // step that finishes here holds its intent until Resume delivers it, so
 // nothing acts until the host has stored the accepted run. A step that halts
 // here ends the run before anything acts. Accept never calls Host.Effect or
-// Host.Save.
+// Host.Save, and it changes run only when it returns Ready or Halted, so a
+// run it declines or returns an error for can be accepted again from scratch.
 func (e *Engine[C]) Accept(c C, run *Run, h Host) (Accepted, error) {
+	if run.Format == 0 {
+		return Declined, ErrNotValidated
+	}
 	if run.Format != FormatVersion {
 		return Declined, ErrFormat
 	}
 	if run.Accepted {
 		return Declined, ErrAccepted
 	}
+	work := run.Clone()
+	res, err := e.accept(c, work, h)
+	if err == nil && res != Declined {
+		*run = *work
+	}
+	return res, err
+}
+
+func (e *Engine[C]) accept(c C, run *Run, h Host) (Accepted, error) {
 	for i := range run.Steps {
 		if run.Steps[i].Status != StatusPending {
 			continue
 		}
 		s, m, err := e.step(run, i)
 		if err != nil {
+			return Declined, err
+		}
+		if err := e.triggerValues(s, m); err != nil {
 			return Declined, err
 		}
 		if m.Admit != nil {
@@ -458,10 +483,13 @@ func (e *Engine[C]) Accept(c C, run *Run, h Host) (Accepted, error) {
 		case kindDecline:
 			return Declined, nil
 		case kindHalt:
+			if err := h.Halt(s, out.value); err != nil {
+				return Declined, err
+			}
 			s.finish()
 			haltAt(run, i)
 			run.Accepted = true
-			return Halted, h.Halt(s, out.value)
+			return Halted, nil
 		case kindDone:
 			if s.bad != "" {
 				return Declined, fmt.Errorf("cmdflow: step %s set undeclared or mistyped output %s", s.ID, s.bad)
@@ -475,6 +503,31 @@ func (e *Engine[C]) Accept(c C, run *Run, h Host) (Accepted, error) {
 	}
 	run.Accepted = true
 	return Ready, nil
+}
+
+// triggerValues checks that each trigger value connected to the step fits
+// the input it is connected to.
+func (e *Engine[C]) triggerValues(s *Step, m Module[C]) error {
+	for _, in := range m.Inputs {
+		from, _, _ := strings.Cut(s.Inputs[in.Name], ".")
+		if from != TriggerStep {
+			continue
+		}
+		if v, ok := s.In(in.Name); ok && !e.Accepts(in, v.Type) {
+			return fmt.Errorf("step %s input %s: %w: %q", s.ID, in.Name, ErrTriggerValue, v.Type)
+		}
+	}
+	return nil
+}
+
+// missing reports whether a required input of the step has no value.
+func missing[C any](s *Step, m Module[C]) bool {
+	for _, in := range m.Inputs {
+		if _, ok := s.In(in.Name); in.Required && !ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Resume runs an accepted run's remaining steps in order, delivering each
@@ -502,7 +555,7 @@ func (e *Engine[C]) Resume(c C, run *Run, h Host) (stopped bool, err error) {
 		case StatusHalted:
 			return false, nil
 		case StatusIntent:
-			if err := e.deliver(run, i, h); err != nil {
+			if err := e.deliver(run, i, h); err != nil || st.Status == StatusFailed {
 				return true, err
 			}
 			continue
@@ -511,10 +564,8 @@ func (e *Engine[C]) Resume(c C, run *Run, h Host) (stopped bool, err error) {
 		if err != nil || m.Run == nil {
 			return true, fail(st, CodeUnavailable, h)
 		}
-		for _, in := range m.Inputs {
-			if _, ok := s.In(in.Name); in.Required && !ok {
-				return true, fail(st, CodeIncomplete, h)
-			}
+		if missing(s, m) {
+			return true, fail(st, CodeIncomplete, h)
 		}
 		out, err := m.Run(c, s)
 		if err != nil {
@@ -526,11 +577,11 @@ func (e *Engine[C]) Resume(c C, run *Run, h Host) (stopped bool, err error) {
 		case kindFail:
 			return true, fail(st, out.code, h)
 		case kindHalt:
-			s.finish()
-			haltAt(run, i)
 			if err := h.Halt(s, out.value); err != nil {
 				return true, err
 			}
+			s.finish()
+			haltAt(run, i)
 			if err := h.Save(); err != nil {
 				return true, err
 			}
@@ -545,7 +596,7 @@ func (e *Engine[C]) Resume(c C, run *Run, h Host) (stopped bool, err error) {
 				return true, err
 			}
 			if st.Status == StatusIntent {
-				if err := e.deliver(run, i, h); err != nil {
+				if err := e.deliver(run, i, h); err != nil || st.Status == StatusFailed {
 					return true, err
 				}
 			}
@@ -557,9 +608,13 @@ func (e *Engine[C]) Resume(c C, run *Run, h Host) (stopped bool, err error) {
 }
 
 // deliver hands step i's intent to the host and saves the run once it is
-// carried out.
+// carried out. An intent missing a required input fails the step instead.
 func (e *Engine[C]) deliver(run *Run, i int, h Host) error {
-	s := &Step{StepRun: &run.Steps[i], run: run}
+	s, m, err := e.step(run, i)
+	if err == nil && missing(s, m) {
+		return fail(s.StepRun, CodeIncomplete, h)
+	}
+	s.def, s.accepts = nil, nil
 	if err := h.Effect(s); err != nil {
 		return err
 	}
@@ -567,11 +622,16 @@ func (e *Engine[C]) deliver(run *Run, i int, h Host) error {
 	return h.Save()
 }
 
+// fail records that the step failed with code once the host has been told,
+// so a Fail error leaves the step where it was for the next Resume.
 func fail(st *StepRun, code string, h Host) error {
-	st.Status, st.Code = StatusFailed, code
+	if code == "" {
+		code = CodeIncomplete
+	}
 	if err := h.Fail(code); err != nil {
 		return err
 	}
+	st.Status, st.Code = StatusFailed, code
 	return h.Save()
 }
 
@@ -589,6 +649,9 @@ type Traced struct {
 // halts it, without changing run. halt is the halting value, if any. A step
 // that fails returns a *StepError.
 func (e *Engine[C]) Simulate(c C, run *Run) (trace []Traced, halt *Value, err error) {
+	if run.Format == 0 {
+		return nil, nil, ErrNotValidated
+	}
 	run = run.Clone()
 	for i := range run.Steps {
 		if run.Steps[i].Status != StatusPending {
@@ -596,6 +659,9 @@ func (e *Engine[C]) Simulate(c C, run *Run) (trace []Traced, halt *Value, err er
 		}
 		s, m, err := e.step(run, i)
 		if err != nil {
+			return trace, nil, err
+		}
+		if err := e.triggerValues(s, m); err != nil {
 			return trace, nil, err
 		}
 		if m.Simulate == nil {
@@ -608,6 +674,9 @@ func (e *Engine[C]) Simulate(c C, run *Run) (trace []Traced, halt *Value, err er
 		switch out.kind {
 		case kindDone, kindHalt:
 		case kindFail:
+			if out.code == "" {
+				out.code = CodeIncomplete
+			}
 			return trace, nil, &StepError{Step: s.ID, Code: out.code}
 		default:
 			return trace, nil, fmt.Errorf("step %s: %w", s.ID, ErrNoPreview)

@@ -141,8 +141,9 @@ type Module[C any] struct {
 // earlier step. Settings are fixed when the command is saved; values that
 // change from run to run travel only through ports.
 type Pipeline struct {
-	// Format is the pipeline format version; Validate sets it, and 0 means
-	// FormatVersion.
+	// Format is the pipeline format version. Validate sets it; 0 means the
+	// pipeline has not been validated, and Snapshot carries that into the
+	// run so Accept refuses it.
 	Format int `json:"format,omitempty"`
 	// Trigger names the trigger kind; empty means the policy's default.
 	Trigger string `json:"trigger,omitempty"`
@@ -449,7 +450,7 @@ func (e *Engine[C]) validate(p *Pipeline, env any) error {
 	}
 	trigger, ok := e.triggers[e.triggerOf(*p)]
 	if !ok {
-		return Errorf("", "", "unknown trigger")
+		return Errorf("", "", "unknown trigger %q", e.triggerOf(*p))
 	}
 	if len(p.Steps) == 0 {
 		return Errorf("", "", "add at least one step")
@@ -467,14 +468,14 @@ func (e *Engine[C]) validate(p *Pipeline, env any) error {
 	for i := range p.Steps {
 		s := &p.Steps[i]
 		if !stepPattern.MatchString(s.ID) || s.ID == TriggerStep {
-			return Errorf(s.ID, "", "step ids are 1–24 lowercase letters, digits or _")
+			return Errorf(s.ID, "", "step ids start with a lowercase letter, then up to 23 lowercase letters, digits or _")
 		}
 		if _, dup := outputs[s.ID]; dup {
 			return Errorf(s.ID, "", "duplicate step id")
 		}
 		m, ok := e.modules[s.Module]
 		if !ok {
-			return Errorf(s.ID, "", "unknown module")
+			return Errorf(s.ID, "", "unknown module %q", s.Module)
 		}
 		if s.Version == 0 {
 			s.Version = m.Version

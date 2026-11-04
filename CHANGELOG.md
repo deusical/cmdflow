@@ -4,6 +4,31 @@ All notable changes are listed here. The project follows
 [Semantic Versioning](https://semver.org/); until 1.0, minor versions may
 change the API.
 
+## [Unreleased]
+
+### Fixed
+
+- A `Host.Halt` or `Host.Fail` that returns an error is called again on the
+  next `Resume`. Before, the run was already marked halted or failed, so the
+  host was never told. `Accept` returns `Declined` with the error when `Halt`
+  fails, leaving the run unaccepted.
+- A sink's intent is delivered only when every required input has a value;
+  otherwise the step fails with `CodeIncomplete`. A sink that finished at
+  acceptance skipped the check.
+- `Accept` changes the run only when it returns `Ready` or `Halted`. Before,
+  an error or a decline left earlier steps finished, and calling `Accept`
+  again skipped their `Admit`.
+- `Fail("")` records `CodeIncomplete` instead of an empty code.
+
+### Added
+
+- `ErrNotValidated`: `Accept` and `Simulate` refuse a run made from a
+  pipeline `Validate` never accepted (its `Format` is 0).
+- `ErrTriggerValue`: `Accept` and `Simulate` refuse a trigger value whose
+  type doesn't fit the input it is connected to.
+- Validation errors name the unknown trigger or module, and the step id
+  message says an id starts with a letter.
+
 ## [0.2.0] - 2026-11-03
 
 This release changes the API and the run format; runs stored by 0.1.0 can't

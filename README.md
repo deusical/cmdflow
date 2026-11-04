@@ -134,7 +134,7 @@ go run ./examples/chatbot
 
 ```go
 err := e.Validate(&cmd, env)                    // when a command is saved; env reaches module settings
-run := cmdflow.Snapshot(cmd, triggerOutputs)    // when the trigger fires
+run := cmdflow.Snapshot(cmd, triggerOutputs)    // when the trigger fires; cmd must be validated
 result, err := e.Accept(ctx, run, host)         // Declined, Ready or Halted; then store the run
 stopped, err := e.Resume(ctx, run, host)        // until !stopped
 trace, halt, err := e.Simulate(ctx, run)        // offline preview; leaves run unchanged
@@ -145,7 +145,11 @@ trace, halt, err := e.Simulate(ctx, run)        // offline preview; leaves run u
    arrives can finish here; the rest are pending. A sink step that finishes
    here holds its intent: **no effect is delivered during Accept**. (A module
    your policy lets act directly is trusted to wait for `Run` itself.) A
-   declined run is discarded; an accepted one is stored by the host.
+   declined run is discarded; an accepted one is stored by the host. Accept
+   changes the run only when it accepts it, so after an error it can be
+   called again on the same run. It refuses a run made from a pipeline
+   `Validate` never accepted, and trigger values whose type doesn't fit the
+   input they're connected to.
 2. **Resume** runs the remaining steps in order, calling `Host.Save` after each
    one finishes, and delivers each sink's intent to `Host.Effect` when its turn
    comes, after every earlier step. A step can `Yield` (for example while a
@@ -155,6 +159,10 @@ trace, halt, err := e.Simulate(ctx, run)        // offline preview; leaves run u
    which goes to `Host.Halt`; the steps after it are skipped. A step can
    **Fail** with a code, which goes to `Host.Fail` and is recorded in the run
    (`run.Failed()`), and the run ends there.
+
+Before delivering an intent, Resume checks that every required input of the
+sink has a value; if one doesn't, the step fails with `CodeIncomplete`
+instead.
 
 The engine refuses to accept a run twice, to resume a run that was never
 accepted, and to resume one that failed.
@@ -179,9 +187,10 @@ What the engine expects of your host:
   `Effect` again for that step. Key effects by your run id and the step id if
   acting twice would hurt. An `Effect` error leaves the intent in the run, and
   the next `Resume` tries again without running the module again.
-- **Errors are retryable.** An error from a module's `Run`, `Effect` or `Save`
-  leaves the run where it was. Retrying, backing off or giving up is your
-  choice.
+- **Errors are retryable.** An error from a module's `Run` or from any `Host`
+  method leaves the run where it was, so the next `Resume` tries again: a
+  `Halt` or `Fail` that returned an error is called again. Retrying, backing
+  off or giving up is your choice.
 - **One goroutine per run at a time.** Two processes resuming the same stored
   run need your storage to stop them (a lock or a version check).
 
