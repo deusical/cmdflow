@@ -4,7 +4,7 @@ All notable changes are listed here. The project follows
 [Semantic Versioning](https://semver.org/); until 1.0, minor versions may
 change the API.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-03
 
 This release changes the API and the run format; runs stored by 0.1.0 can't
 be resumed.
@@ -77,4 +77,5 @@ First public release.
   `Policy.Direct`.
 - Example chat bot in `examples/chatbot`.
 
+[0.2.0]: https://github.com/deusical/cmdflow/releases/tag/v0.2.0
 [0.1.0]: https://github.com/deusical/cmdflow/releases/tag/v0.1.0
