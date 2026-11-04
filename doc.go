@@ -25,7 +25,7 @@
 //   - Composition only: configuration can connect registered modules, never
 //     add code, so a command can't exceed the registered capabilities.
 //
-// A typical host calls Validate when a command is saved, Snapshot and Accept
-// when its trigger fires, stores the Run, and calls Resume until it is no
+// A typical host calls Validate when a command is saved, Snapshot (of the
+// validated pipeline) and Accept when its trigger fires, stores the Run, and calls Resume until it is no
 // longer stopped. Simulate previews a command offline.
 package cmdflow
