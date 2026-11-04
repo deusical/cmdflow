@@ -4,6 +4,14 @@ All notable changes are listed here. The project follows
 [Semantic Versioning](https://semver.org/); until 1.0, minor versions may
 change the API.
 
+## [0.2.2] - 2026-11-04
+
+### Fixed
+
+- `Take` called from `Host.Effect` clears the taken data once the effect is
+  delivered. Before, it never did, so a host that moved a large value (such
+  as a file) out of the run in `Effect` stored it twice.
+
 ## [0.2.1] - 2026-11-03
 
 ### Fixed
@@ -102,6 +110,7 @@ First public release.
   `Policy.Direct`.
 - Example chat bot in `examples/chatbot`.
 
+[0.2.2]: https://github.com/deusical/cmdflow/releases/tag/v0.2.2
 [0.2.1]: https://github.com/deusical/cmdflow/releases/tag/v0.2.1
 [0.2.0]: https://github.com/deusical/cmdflow/releases/tag/v0.2.0
 [0.1.0]: https://github.com/deusical/cmdflow/releases/tag/v0.1.0

@@ -315,3 +315,47 @@ func TestIntentSurvivesStorage(t *testing.T) {
 		t.Fatal("intent lost in storage", err, stored.Steps[2].Status)
 	}
 }
+
+// takeHost moves the intent's file out of the run, as a host that sends it
+// does, and can refuse the first delivery.
+type takeHost struct {
+	toyHost
+	refuse bool
+	got    []string
+}
+
+func (h *takeHost) Effect(s *Step) error {
+	v, _ := s.Take("text")
+	h.got = append(h.got, string(v.Data))
+	if h.refuse {
+		h.refuse = false
+		return errors.New("busy")
+	}
+	return nil
+}
+
+func TestTakeInEffectClearsOnDelivery(t *testing.T) {
+	e := toyEngine(Policy{})
+	e.Register(Module[*toyCtx]{
+		Definition: Definition{ID: "blob", Version: 1, Title: "Blob", Effect: Pure, Outputs: []Port{{Name: "b", Types: []string{"text"}}}},
+		Run: func(_ *toyCtx, s *Step) (Outcome, error) {
+			s.Out("b", Value{Type: "text", Data: json.RawMessage(`"big"`)})
+			return Done(), nil
+		},
+	})
+	p := mustValidate(t, e, Pipeline{Steps: []StepConfig{step("b", "blob", nil, ""), step("say", "print", map[string]string{"text": "b.b"}, "")}})
+	run := Snapshot(p, nil)
+	h := &takeHost{refuse: true}
+	if _, err := e.Accept(&toyCtx{}, run, h); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Resume(&toyCtx{}, run, h); err == nil || run.Steps[1].Outputs["b"].Data == nil {
+		t.Fatal("a refused effect lost the taken data", err)
+	}
+	if stopped, err := e.Resume(&toyCtx{}, run, h); stopped || err != nil {
+		t.Fatal(stopped, err)
+	}
+	if len(h.got) != 2 || h.got[1] != `"big"` || run.Steps[1].Outputs["b"].Data != nil {
+		t.Fatal("the delivered effect's take kept the data in the run", h.got, string(run.Steps[1].Outputs["b"].Data))
+	}
+}

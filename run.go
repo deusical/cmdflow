@@ -145,9 +145,10 @@ func (s *Step) In(port string) (Value, bool) {
 	return v, ok
 }
 
-// Take returns the value connected to port. Once this step finishes, the
-// value's Data is cleared in the producing step, so large content is stored
-// once. If this step yields or fails instead, the Data stays.
+// Take returns the value connected to port. Once this step finishes (or, in
+// Host.Effect, once the effect is delivered), the value's Data is cleared in
+// the producing step, so large content is stored once. If this step yields
+// or fails, or Effect returns an error, the Data stays.
 func (s *Step) Take(port string) (Value, bool) {
 	from, name, ok := s.source(port)
 	if !ok || !from.Finished() {
@@ -618,6 +619,8 @@ func (e *Engine[C]) deliver(run *Run, i int, h Host) error {
 	if err := h.Effect(s); err != nil {
 		return err
 	}
+	// The effect's Takes complete with it, so the run stores taken data once.
+	s.finish()
 	s.Status = StatusDone
 	return h.Save()
 }
