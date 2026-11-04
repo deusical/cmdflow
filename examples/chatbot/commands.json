@@ -1,0 +1,15 @@
+{
+  "shout": {
+    "steps": [
+      { "id": "loud", "module": "text.upper", "inputs": { "text": "trigger.args" } },
+      { "id": "say", "module": "reply", "inputs": { "text": "loud.text" } }
+    ]
+  },
+  "slowshout": {
+    "steps": [
+      { "id": "loud", "module": "text.upper", "inputs": { "text": "trigger.args" }, "settings": { "suffix": "!!" } },
+      { "id": "work", "module": "work.wait", "inputs": { "text": "loud.text" } },
+      { "id": "say", "module": "reply", "inputs": { "text": "work.text" } }
+    ]
+  }
+}
