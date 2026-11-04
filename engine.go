@@ -14,19 +14,30 @@ import (
 // TriggerStep is the reserved step id whose outputs are the trigger's.
 const TriggerStep = "trigger"
 
-// Effect classes describe what running a module does.
+// FormatVersion is the version of the Pipeline and Run JSON formats this
+// package reads and writes.
+const FormatVersion = 1
+
+// Effect is a module's effect class: what running it does.
+type Effect string
+
+// Effect classes. Only Sink changes what the engine does: a sink step's
+// intent goes to Host.Effect. The others are declarations for the host and
+// for anyone reading a command.
 const (
 	// Pure modules compute outputs from inputs and settings.
-	Pure = "pure"
+	Pure Effect = "pure"
 	// Local modules do work on the host, such as downloading a file.
-	Local = "local"
+	Local Effect = "local"
 	// Paid modules make requests that cost money, such as AI calls.
-	Paid = "paid"
+	Paid Effect = "paid"
 	// Sink modules act on the outside world. Unless the policy lets a module
 	// act directly, its step's connected inputs are an intent the host's
 	// Effect carries out or refuses.
-	Sink = "sink"
+	Sink Effect = "sink"
 )
+
+func (f Effect) valid() bool { return f == Pure || f == Local || f == Paid || f == Sink }
 
 // Type is a value type steps exchange. Is lists other types a value of this
 // type also counts as: an input accepting "file" accepts a "video" whose Is
@@ -84,7 +95,7 @@ type Definition struct {
 	Inputs      []Port `json:"inputs"`
 	Outputs     []Port `json:"outputs"`
 	// Effect is one of Pure, Local, Paid or Sink.
-	Effect string `json:"effect"`
+	Effect Effect `json:"effect"`
 	// RetryClass and ResourceClass are free-form hints for the host, such
 	// as whether a failed step may be retried or which worker pool runs it.
 	RetryClass    string `json:"retry_class,omitempty"`
@@ -108,22 +119,31 @@ type Module[C any] struct {
 	// whatever the host passes to Validate.
 	Settings func(raw json.RawMessage, env any) (json.RawMessage, error)
 	// AcceptOnly modules work only at acceptance, so every input must be
-	// known then.
+	// known then. A module without Run is AcceptOnly.
 	AcceptOnly bool
 	// Admit, when set, runs for every step before any step is accepted;
 	// false declines the run.
 	Admit func(c C, s *Step) (bool, error)
 	// Accept runs when the run is accepted: Done, Pending (runs later),
-	// Halt or Decline.
+	// Halt or Decline. Without Accept, the step is pending.
 	Accept func(c C, s *Step) (Outcome, error)
-	// Run runs a pending step: Done, Yield, Halt or Fail.
+	// Run runs a pending step: Done, Yield, Halt or Fail. Returning an error
+	// instead leaves the step pending, for the host to retry.
 	Run func(c C, s *Step) (Outcome, error)
 	// Simulate previews the step offline: Done or Halt.
 	Simulate func(c C, s *Step) (Outcome, error)
 }
 
-// Pipeline is a command's recipe as configured.
+// Pipeline is a command's recipe as configured. It holds only what runs it:
+// a client that lays steps out (positions, colours) stores that separately.
+//
+// Steps are a list today, and each input connects to the trigger or an
+// earlier step. Settings are fixed when the command is saved; values that
+// change from run to run travel only through ports.
 type Pipeline struct {
+	// Format is the pipeline format version; Validate sets it, and 0 means
+	// FormatVersion.
+	Format int `json:"format,omitempty"`
 	// Trigger names the trigger kind; empty means the policy's default.
 	Trigger string `json:"trigger,omitempty"`
 	// ExecutionMinutes is for the host, such as a deadline for long runs.
@@ -196,7 +216,8 @@ type Policy struct {
 	MaxSteps int
 	// MaxEffects limits sink steps; 0 means no limit.
 	MaxEffects int
-	// EffectLast requires every sink step to be the last step.
+	// EffectLast requires every sink step to be the last step. Like
+	// RequireEffect, it is defined by position in the list of steps.
 	EffectLast bool
 	// RequireEffect requires the last step to be a sink.
 	RequireEffect bool
@@ -218,10 +239,15 @@ type Info struct {
 	Consumers map[string][]string
 }
 
-// Error explains why a pipeline is invalid, naming the step and port.
+// Error explains why a pipeline is invalid, naming the step and port. Err is
+// the underlying error, such as one a module's Settings returned.
 type Error struct {
 	Step, Port, Reason string
+	Err                error
 }
+
+// Unwrap returns the underlying error, if any.
+func (e *Error) Unwrap() error { return e.Err }
 
 func (e *Error) Error() string {
 	where := e.Step
@@ -259,39 +285,73 @@ func New[C any](policy Policy) *Engine[C] {
 	return &Engine[C]{Policy: policy, modules: map[string]Module[C]{}, types: map[string]Type{}, triggers: map[string]Trigger{}}
 }
 
-// Register adds a module. A module without Accept runs on Resume. Registering
-// an id twice, or a port without a type, panics: both are programming errors.
+// Register adds a module. A module without Accept runs on Resume; one
+// without Run works only at acceptance. Register panics on programming
+// errors: a duplicate or empty id, a version below 1, an unknown effect
+// class, neither Accept nor Run, an Immediate or AcceptOnly module without
+// Accept, or a duplicate or untyped port.
 func (e *Engine[C]) Register(m Module[C]) {
-	if _, exists := e.modules[m.ID]; exists {
+	switch {
+	case m.ID == "":
+		panic("cmdflow: module without an id")
+	case e.modules[m.ID].ID != "":
 		panic("cmdflow: duplicate module " + m.ID)
+	case m.Version < 1:
+		panic("cmdflow: module " + m.ID + " needs a version of 1 or more")
+	case !m.Effect.valid():
+		panic("cmdflow: module " + m.ID + " has unknown effect class " + strings.TrimSpace(string(m.Effect)))
+	case m.Accept == nil && m.Run == nil:
+		panic("cmdflow: module " + m.ID + " has neither Accept nor Run")
 	}
-	mustType(m.ID, m.Inputs)
-	mustType(m.ID, m.Outputs)
+	if m.Run == nil {
+		m.AcceptOnly = true
+	}
+	if (m.Immediate || m.AcceptOnly) && m.Accept == nil {
+		panic("cmdflow: module " + m.ID + " works at acceptance but has no Accept")
+	}
+	mustPorts(m.ID, m.Inputs)
+	mustPorts(m.ID, m.Outputs)
 	if m.Settings == nil {
 		m.Settings = NoSettings
 	}
 	e.modules[m.ID] = m
 }
 
-// RegisterType adds a value type.
-func (e *Engine[C]) RegisterType(t Type) { e.types[t.ID] = t }
+// RegisterType adds a value type. Registering an id twice panics.
+func (e *Engine[C]) RegisterType(t Type) {
+	if _, exists := e.types[t.ID]; exists {
+		panic("cmdflow: duplicate type " + t.ID)
+	}
+	e.types[t.ID] = t
+}
 
-// RegisterTrigger adds a trigger kind. An output without a type panics.
+// RegisterTrigger adds a trigger kind. Registering an id twice, or a
+// duplicate or untyped output, panics.
 func (e *Engine[C]) RegisterTrigger(t Trigger) {
-	mustType(t.ID, t.Outputs)
+	if _, exists := e.triggers[t.ID]; exists {
+		panic("cmdflow: duplicate trigger " + t.ID)
+	}
+	mustPorts(t.ID, t.Outputs)
 	e.triggers[t.ID] = t
 }
 
-func mustType(owner string, ports []Port) {
+func mustPorts(owner string, ports []Port) {
+	seen := map[string]bool{}
 	for _, p := range ports {
 		if len(p.Types) == 0 {
 			panic("cmdflow: port " + owner + "." + p.Name + " has no type")
 		}
+		if seen[p.Name] {
+			panic("cmdflow: duplicate port " + owner + "." + p.Name)
+		}
+		seen[p.Name] = true
 	}
 }
 
 // RegisterUpgrade adds a function that rewrites old configuration before it
-// is validated, such as a module split into two.
+// is validated, such as a module split into two. Upgrades run, in the order
+// registered, every time Validate runs, so each must leave configuration it
+// has already upgraded unchanged.
 func (e *Engine[C]) RegisterUpgrade(f func(*Pipeline)) { e.upgrades = append(e.upgrades, f) }
 
 // Module returns a registered module.
@@ -365,11 +425,27 @@ func portOf(ports []Port, name string) (Port, bool) {
 }
 
 // Validate applies upgrades, checks a pipeline's structure and the policy,
-// and normalizes settings and versions in place. env is passed to modules'
-// Settings and is otherwise the host's.
+// and normalizes its format, settings and versions. env is passed to
+// modules' Settings and is otherwise the host's. p changes only when it is
+// valid.
 func (e *Engine[C]) Validate(p *Pipeline, env any) error {
+	q := p.Clone()
+	if err := e.validate(&q, env); err != nil {
+		return err
+	}
+	*p = q
+	return nil
+}
+
+func (e *Engine[C]) validate(p *Pipeline, env any) error {
 	for _, up := range e.upgrades {
 		up(p)
+	}
+	if p.Format == 0 {
+		p.Format = FormatVersion
+	}
+	if p.Format != FormatVersion {
+		return Errorf("", "", "unsupported format %d", p.Format)
 	}
 	trigger, ok := e.triggers[e.triggerOf(*p)]
 	if !ok {
@@ -423,7 +499,7 @@ func (e *Engine[C]) Validate(p *Pipeline, env any) error {
 				return Errorf(s.ID, port, "unknown input")
 			}
 		}
-		known := m.Immediate
+		known := true // every connected input is known at acceptance
 		for _, in := range m.Inputs {
 			binding := s.Inputs[in.Name]
 			if binding == "" {
@@ -446,7 +522,11 @@ func (e *Engine[C]) Validate(p *Pipeline, env any) error {
 		}
 		settings, err := m.Settings(s.Settings, env)
 		if err != nil {
-			return Errorf(s.ID, "", "%s", err.Error())
+			var perr *Error
+			if errors.As(err, &perr) && perr.Step == "" {
+				return &Error{Step: s.ID, Port: perr.Port, Reason: perr.Reason, Err: err}
+			}
+			return &Error{Step: s.ID, Reason: err.Error(), Err: err}
 		}
 		s.Settings = settings
 		outputs[s.ID] = map[string]string{}
@@ -456,7 +536,7 @@ func (e *Engine[C]) Validate(p *Pipeline, env any) error {
 		if m.AcceptOnly && !known {
 			return Errorf(s.ID, "", "this step needs inputs that are known when the command arrives")
 		}
-		immediate[s.ID] = known
+		immediate[s.ID] = known && (m.Immediate || m.AcceptOnly)
 	}
 	if e.Policy.Check != nil {
 		return e.Policy.Check(p, Info{Immediate: immediate, Consumers: consumers})
