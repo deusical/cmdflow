@@ -226,8 +226,8 @@ most once and no loops, so runs stay bounded.
 
 Pre-1.0. The API may change between minor versions until 1.0; changes are
 listed in [CHANGELOG.md](CHANGELOG.md). cmdflow was extracted from the
-command pipeline in [SmsBot](https://github.com/deusical/smsbot-server). SmsBot
-still runs its own copy of that pipeline, not this package.
+command pipeline in [SmsBot](https://github.com/deusical/smsbot-server), which
+uses this package for every chat command.
 
 ## Contributing
 
